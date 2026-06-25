@@ -181,6 +181,16 @@ const ADMIN_PASSWORD = "USDun2026";
    ================================================================ */
 const SCALE = { issue:1, exact:3 };
 
+/* Barème phase finale : points "bonne issue" par tour + points "score exact" par phase du match */
+const ROUNDS = {
+  r32:  { label:"16es de finale",  issue:10 },
+  r16:  { label:"8es de finale",   issue:20 },
+  qf:   { label:"Quarts de finale",issue:30 },
+  sf:   { label:"Demi-finales",    issue:40 },
+  final:{ label:"Finale",          issue:50 },
+};
+const KO_EXACT = { reg:30, aet:50, pens:100 };
+
 /* Initialisation Firebase (avec repli localStorage si non configuré) */
 let db = null;
 try{
@@ -312,11 +322,45 @@ function matchPoints(pred, real){
   if(Math.sign(ph-pa)===Math.sign(rh-ra)) return SCALE.issue;
   return 0;
 }
+/* Vainqueur d'un match à élimination directe : équipe 1 ("home") ou 2 ("away"), ou null si indéterminé */
+function knockoutWinner(v){
+  if(!v) return null;
+  const h=num(v.h), a=num(v.a);
+  if(h==null||a==null) return null;
+  if(h>a) return "home";
+  if(a>h) return "away";
+  const ph=num(v.pens_h), pa=num(v.pens_a);
+  if(ph==null||pa==null||ph===pa) return null;
+  return ph>pa ? "home" : "away";
+}
+/* Points d'un match de phase finale : bonne issue (selon le tour) + score exact (selon réglementaire/prolongation/pénaltys), cumulés */
+function knockoutPoints(pred, real, round){
+  if(!pred||!real) return {total:0,exact:0,issue:0};
+  const ph=num(pred.h),pa=num(pred.a),rh=num(real.h),ra=num(real.a);
+  if(ph==null||pa==null||rh==null||ra==null) return {total:0,exact:0,issue:0};
+  const winR=ROUNDS[round];
+  const predWinner=knockoutWinner(pred), realWinner=knockoutWinner(real);
+  const issuePts = (winR && predWinner && predWinner===realWinner) ? winR.issue : 0;
+  let exactPts=0;
+  if(ph===rh && pa===ra){
+    if(rh===ra){
+      const rph=num(real.pens_h), rpa=num(real.pens_a);
+      const pph=num(pred.pens_h), ppa=num(pred.pens_a);
+      if(rph!=null&&rpa!=null&&pph!=null&&ppa!=null&&rph===pph&&rpa===ppa) exactPts=KO_EXACT.pens;
+    } else if(real.aet){
+      if(pred.aet) exactPts=KO_EXACT.aet;
+    } else {
+      if(!pred.aet) exactPts=KO_EXACT.reg;
+    }
+  }
+  return { total: issuePts+exactPts, exact: exactPts>0?1:0, issue: issuePts>0?1:0 };
+}
 function scoreParticipant(part, official){
   const res=(official&&official.results)||{}, preds=part.preds||{};
-  const all=[...MATCHES, ...(((official&&official.knockout))||[])];
+  const ko=((official&&official.knockout))||[];
   let total=0,exact=0,issue=0;
-  all.forEach(m=>{ const p=matchPoints(preds[m.id], res[m.id]); if(p===SCALE.exact)exact++; else if(p===SCALE.issue)issue++; total+=p; });
+  MATCHES.forEach(m=>{ const p=matchPoints(preds[m.id], res[m.id]); if(p===SCALE.exact)exact++; else if(p===SCALE.issue)issue++; total+=p; });
+  ko.forEach(m=>{ const r=knockoutPoints(preds[m.id], res[m.id], m.round); total+=r.total; exact+=r.exact; issue+=r.issue; });
   return {total,exact,issue};
 }
 /* Classement trié + rangs (ex æquo) — partagé par l'espace classement et l'organisateur */
@@ -347,10 +391,13 @@ function useNow(){
 function MatchRow({ m, val, onSet, now, lockable }){
   const locked = lockable && isLocked(m.ko, now);
   const v = val || {h:"",a:""};
+  const nh=num(v.h), na=num(v.a);
+  const showAet = !!m.round && nh!=null && na!=null && nh!==na;
+  const showPens = !!m.round && nh!=null && na!=null && nh===na;
   return (
     <div className="match">
       <div className="date">
-        <span>{m.label?`🏆 ${m.label}`:`📅 ${m.dateLabel||fmt(m.ko)}`}</span>
+        <span>{m.label?`🏆 ${m.round&&ROUNDS[m.round]?ROUNDS[m.round].label+" — ":""}${m.label}`:`📅 ${m.dateLabel||fmt(m.ko)}`}</span>
         {lockable && m.ko && (locked
           ? <span className="lockTag">🔒 pronostic clos</span>
           : <span className="openTag">⏳ clôture {fmt(deadlineMs(m.ko))}</span>)}
@@ -362,6 +409,20 @@ function MatchRow({ m, val, onSet, now, lockable }){
         <input type="number" min="0" max="30" value={v.a} disabled={locked} onChange={e=>onSet(m.id,"a",e.target.value)} aria-label={(m.away||"")+" buts"} />
       </div>
       <div className="side right"><span className="tname">{m.away||"—"}</span><span className="flag">{flag(m.away)}</span></div>
+      {showAet && (
+        <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,marginTop:4,gridColumn:"1/-1",cursor:locked?"default":"pointer"}}>
+          <input type="checkbox" checked={!!v.aet} disabled={locked} onChange={e=>onSet(m.id,"aet",e.target.checked)} />
+          Vainqueur après prolongation
+        </label>
+      )}
+      {showPens && (
+        <div style={{display:"flex",alignItems:"center",gap:8,fontSize:13,marginTop:4,gridColumn:"1/-1"}}>
+          <span>Tirs au but :</span>
+          <input type="number" min="0" max="30" style={{width:54}} value={v.pens_h||""} disabled={locked} onChange={e=>onSet(m.id,"pens_h",e.target.value)} aria-label={(m.home||"")+" t.a.b."} />
+          <span>–</span>
+          <input type="number" min="0" max="30" style={{width:54}} value={v.pens_a||""} disabled={locked} onChange={e=>onSet(m.id,"pens_a",e.target.value)} aria-label={(m.away||"")+" t.a.b."} />
+        </div>
+      )}
     </div>
   );
 }
@@ -407,8 +468,16 @@ function ScaleCard(){
   return (
     <div className="card">
       <h2 className="section-title">📊 Barème</h2>
+      <p className="section-sub" style={{marginBottom:6}}><b>Phase de poules</b></p>
       <div className="scale-item"><span className="scale-pts">+{SCALE.issue}</span><span><b>Bonne issue</b> (bon vainqueur ou match nul)</span></div>
       <div className="scale-item"><span className="scale-pts">+{SCALE.exact}</span><span><b>Score exact</b> (inclut la bonne issue + bonus)</span></div>
+      <p className="section-sub" style={{margin:"14px 0 6px"}}><b>Phase finale</b> — les points "bonne issue" et "score exact" se cumulent</p>
+      {Object.keys(ROUNDS).map(k=>(
+        <div className="scale-item" key={k}><span className="scale-pts">+{ROUNDS[k].issue}</span><span><b>Bon vainqueur</b> en {ROUNDS[k].label}</span></div>
+      ))}
+      <div className="scale-item"><span className="scale-pts">+{KO_EXACT.reg}</span><span><b>Score exact</b> à la fin du temps réglementaire</span></div>
+      <div className="scale-item"><span className="scale-pts">+{KO_EXACT.aet}</span><span><b>Score exact</b> après prolongation</span></div>
+      <div className="scale-item"><span className="scale-pts">+{KO_EXACT.pens}</span><span><b>Score exact</b> + score des tirs au but exact</span></div>
       <p className="hint" style={{marginTop:10}}>Chaque match ferme aux pronostics <b>au coup d'envoi</b>.</p>
     </div>
   );
@@ -673,7 +742,7 @@ function AdminPanel({ showToast }){
   const setResult=useCallback((id,side,val)=>setOfficial(o=>{ const n={...o,results:{...o.results,[id]:{...(o.results[id]||{h:"",a:""}),[side]:val}}}; clearTimeout(saveTimer.current); saveTimer.current=setTimeout(()=>DB.saveOfficial(n),500); return n; }),[]);
 
   // Gestion des matchs de phase finale
-  const addKo=()=>persist({...official, knockout:[...(official.knockout||[]), {id:"k"+Date.now(), label:"", home:"", away:"", ko:""}]});
+  const addKo=()=>persist({...official, knockout:[...(official.knockout||[]), {id:"k"+Date.now(), round:"", label:"", home:"", away:"", ko:""}]});
   const updKo=(i,k,v)=>{ const arr=[...official.knockout]; arr[i]={...arr[i],[k]:v}; persist({...official,knockout:arr}); };
   const rmKo=i=>{ const arr=official.knockout.filter((_,j)=>j!==i); persist({...official,knockout:arr}); };
 
@@ -726,6 +795,11 @@ function AdminPanel({ showToast }){
           (les pronostics se fermeront au coup d'envoi). Renseigne le score une fois le match joué.</p>
         {(official.knockout||[]).map((m,i)=>(
           <div className="ko-card" key={m.id}>
+            <div className="field"><label>Tour</label>
+              <select value={m.round||""} onChange={e=>updKo(i,"round",e.target.value)}>
+                <option value="">— Choisir —</option>
+                {Object.keys(ROUNDS).map(k=> <option key={k} value={k}>{ROUNDS[k].label} (+{ROUNDS[k].issue}pts bonne issue)</option>)}
+              </select></div>
             <div className="field"><label>Intitulé du match</label>
               <input type="text" value={m.label} onChange={e=>updKo(i,"label",e.target.value)} placeholder="ex. 8e de finale n°1" /></div>
             <div className="grid2">
